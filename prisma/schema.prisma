@@ -1,7 +1,5 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// Prospection écoles privées — Schéma Prisma
+// Formiris (enseignants sous contrat) + OPCO AKTO (personnel non-enseignant)
 
 generator client {
   provider = "prisma-client"
@@ -10,4 +8,294 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RÉFÉRENTIEL ÉTABLISSEMENTS (source : annuaire MEN, import CSV)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Etablissement {
+  uai               String   @id // Unité Administrative Immatriculée
+  nomEtablissement  String
+  type              String   // École, Collège, Lycée…
+  nature            String?
+  typeContratBrut   String?
+  // Sous contrat | Hors contrat | Inconnu
+  statutContrat     StatutContrat @default(Inconnu)
+
+  adresse           String?
+  codePostal        String?
+  ville             String?
+  codeDept          String?
+  departement       String?
+  region            String?
+  telephone         String?
+  email             String?
+  siteWeb           String?
+  siret             String?
+
+  // Géocodage BAN (renseigné par worker Phase 2)
+  latitude          Float?
+  longitude         Float?
+  geocodedAt        DateTime?
+
+  // Canal Formiris (enseignants des sous contrat uniquement)
+  publicFormiris    Boolean  @default(false)
+  // Canal OPCO (personnel non-enseignant partout + tout le personnel hors contrat)
+  publicOpco        Boolean  @default(false)
+  opcoProb          String?  // Détail OPCO probable (ex: "AKTO CCN EPNL IDCC 3218")
+
+  // Formations pertinentes selon le profil (liste JSON : slugs)
+  formationsProposables String[] @default([])
+
+  // Enrichissement manuel
+  contactDecisionnaire String?
+  fonctionContact      String?
+  profilPedagogiqueNotes String?
+
+  etat              String   @default("Ouvert")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  contacts          Contact[]
+  activites         Activite[]
+  pipelineEntries   PipelineEntry[]
+  enrollments       SequenceEnrollment[]
+
+  @@map("etablissements")
+}
+
+enum StatutContrat {
+  SousContrat  @map("Sous contrat")
+  HorsContrat  @map("Hors contrat")
+  Inconnu
+
+  @@map("statut_contrat")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONTACTS DÉCISIONNAIRES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Contact {
+  id              String   @id @default(cuid())
+  etablissementId String
+  etablissement   Etablissement @relation(fields: [etablissementId], references: [uai], onDelete: Cascade)
+
+  prenom          String?
+  nom             String?
+  fonction        String?  // Chef d'établissement, Directeur, Adjoint…
+  email           String?
+  telephone       String?
+  linkedin        String?
+
+  // manual | scraping | linkedin | import
+  source          ContactSource @default(manual)
+  sourceUrl       String?
+
+  notes           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  activites       Activite[]
+  enrollments     SequenceEnrollment[]
+
+  @@map("contacts")
+}
+
+enum ContactSource {
+  manual
+  scraping
+  linkedin
+  import
+
+  @@map("contact_source")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ACTIVITÉS (log de toutes les interactions)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Activite {
+  id              String   @id @default(cuid())
+  etablissementId String
+  etablissement   Etablissement @relation(fields: [etablissementId], references: [uai], onDelete: Cascade)
+  contactId       String?
+  contact         Contact? @relation(fields: [contactId], references: [id])
+
+  type            TypeActivite
+  canal           CanalActivite?
+  objet           String?
+  contenu         String?  // Corps du mail, notes d'appel…
+  statut          String?  // envoyé, ouvert, cliqué, répondu…
+
+  // Tracking email (pixel + clic)
+  ouvertLe        DateTime?
+  cliqueLe        DateTime?
+
+  // Référence séquence si automatisé
+  sequenceId      String?
+  sequence        Sequence? @relation(fields: [sequenceId], references: [id])
+  enrollmentId    String?
+  enrollment      SequenceEnrollment? @relation(fields: [enrollmentId], references: [id])
+
+  scheduledAt     DateTime?
+  executedAt      DateTime?
+  createdAt       DateTime @default(now())
+
+  @@map("activites")
+}
+
+enum TypeActivite {
+  email
+  linkedin
+  appel
+  reponse
+  note
+  rdv
+  simulation // envoi simulé (V1)
+
+  @@map("type_activite")
+}
+
+enum CanalActivite {
+  email
+  linkedin
+  telephone
+  visio
+  presentiel
+
+  @@map("canal_activite")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIPELINE KANBAN
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PipelineEntry {
+  id              String   @id @default(cuid())
+  etablissementId String   @unique
+  etablissement   Etablissement @relation(fields: [etablissementId], references: [uai], onDelete: Cascade)
+
+  statut          StatutPipeline @default(AContacter)
+  // Formiris | OPCO | Mixte
+  canalFinancement CanalFinancement @default(Mixte)
+  valeurEstimee   Float?   // CA potentiel estimé en €
+  probabilite     Float?   // 0.0 à 1.0 — pour le CA pondéré dashboard
+
+  notes           String?
+  movedAt         DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("pipeline_entries")
+}
+
+enum StatutPipeline {
+  AContacter   @map("À contacter")
+  Contacte     @map("Contacté")
+  Echange      @map("Échange")
+  RDV
+  Proposition
+  Gagne        @map("Gagné")
+  Perdu
+  Dormant
+
+  @@map("statut_pipeline")
+}
+
+enum CanalFinancement {
+  Formiris
+  OPCO
+  Mixte
+
+  @@map("canal_financement")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEMPLATES EMAIL / LINKEDIN
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Template {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  nom         String
+  // email | linkedin
+  canal       String   @default("email")
+  // Pitch 1 Formiris | Pitch 2 OPCO sous contrat | Pitch 3 OPCO hors contrat
+  pitchType   String?
+  objet       String?  // Sujet email
+  contenu     String   // Corps en HTML/Markdown avec variables Mustache
+
+  // Variables disponibles : {{prenom}} {{nom}} {{etablissement}} {{ville}}
+  // {{type}} {{statut_contrat}} {{formations}}
+  variables   String[] @default([])
+
+  actif       Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("templates")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SÉQUENCES MULTI-TOUCH (J0 / J+3 / J+7 / J+14 / J+21)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Sequence {
+  id          String   @id @default(cuid())
+  nom         String
+  description String?
+  pitchType   String?  // formiris | opco-sous-contrat | opco-hors-contrat
+
+  // Étapes JSON : [{jour: 0, canal: "email", templateSlug: "pitch-formiris-j0", description: "…"}]
+  steps       Json     @default("[]")
+
+  actif       Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  enrollments SequenceEnrollment[]
+  activites   Activite[]
+
+  @@map("sequences")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INSCRIPTIONS AUX SÉQUENCES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model SequenceEnrollment {
+  id              String   @id @default(cuid())
+  etablissementId String
+  etablissement   Etablissement @relation(fields: [etablissementId], references: [uai], onDelete: Cascade)
+  sequenceId      String
+  sequence        Sequence @relation(fields: [sequenceId], references: [id])
+  contactId       String?
+  contact         Contact? @relation(fields: [contactId], references: [id])
+
+  currentStep     Int      @default(0)  // index dans sequence.steps
+  startedAt       DateTime @default(now())
+  pausedAt        DateTime?
+  completedAt     DateTime?
+  // Raison de sortie : reponse | stop | erreur | manuel
+  exitReason      String?
+
+  statut          StatutEnrollment @default(active)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  activites       Activite[]
+
+  @@unique([etablissementId, sequenceId])
+  @@map("sequence_enrollments")
+}
+
+enum StatutEnrollment {
+  active
+  paused
+  completed
+  exited
+
+  @@map("statut_enrollment")
 }

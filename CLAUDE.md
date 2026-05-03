@@ -164,24 +164,28 @@ Un commit = un changement cohérent. Jamais de commits fourre-tout.
 
 ## État actuel
 
-### Phase 0 — Bootstrap (EN COURS)
+### Phase 0 — Bootstrap (TERMINÉ ✓)
+Next.js 15, shadcn/ui, Prisma 7 + adapter-pg, tRPC, TanStack, NextAuth v5, Inngest, Vitest, Playwright.
+
+### Phase 1 — Modèle de données + import CSV (TERMINÉ ✓)
 
 **Fait** :
-- [x] Next.js 15 (App Router, TS strict, Tailwind 4, ESLint) créé
-- [x] shadcn/ui initialisé (base style), composants de base installés
-- [x] Prisma 7 initialisé (datasource PostgreSQL, prisma.config.ts)
-- [x] Dépendances installées : tRPC, TanStack Query/Table, Zod, NextAuth v5,
-      Resend, MapLibre, Vitest, Playwright, Inngest, tsx
-- [x] `.env.example` créé
-- [x] Scripts package.json complets (dev, typecheck, lint, test, db:*)
-- [x] `CLAUDE.md` créé (ce fichier)
-- [x] Git init + repo GitHub privé
+- [x] Schéma Prisma 7 modèles (Etablissement, Contact, Activite, PipelineEntry, Template, Sequence, SequenceEnrollment)
+- [x] Prisma 7 avec @prisma/adapter-pg (pattern adapter obligatoire en v7)
+- [x] Seed : 6 templates (3 emails J0 + 2 LinkedIn + 1 relance) + 3 séquences × 5 étapes
+- [x] tRPC router `etablissement.importCsv` : parse CSV `;` UTF-8 BOM, upsert par UAI
+- [x] `derivePublics()` : calcule publicFormiris/publicOpco/formationsProposables selon statut
+- [x] Page `/import` : drop-zone, barre de progression, résultat (ajoutés/mis à jour)
+- [x] Vitest 5/5 ✓ : 1888 lignes / 1191 SC / 684 HC / 13 Inconnu / parsing < 30s
 
-**Reste** :
-- [ ] Premier commit conventionnel
-- [ ] Vérifier `pnpm dev` → GATE 0
+**Note CSV** : 7 UAI apparaissent 2 ou 3 fois (ensembles scolaires multi-niveaux)
+→ 1888 lignes dans le CSV, 1879 établissements uniques en base après upsert.
 
-### Phase 1 — Modèle de données + import CSV (À FAIRE)
+**Décisions d'archi Phase 1** :
+- Prisma 7 requiert `@prisma/adapter-pg` + `pg` (new PrismaClient({ adapter }))
+- Import depuis `@/generated/prisma/client` (pas d'index.ts dans le dossier généré)
+- formationsProposables derivées à l'import (non stockées séparément en Phase 1)
+
 ### Phase 2 — Liste + filtres + fiche (À FAIRE)
 ### Phase 3 — Composer email + séquences (À FAIRE)
 ### Phase 4 — Pipeline kanban + dashboard (À FAIRE)
