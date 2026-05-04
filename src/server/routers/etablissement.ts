@@ -1,72 +1,104 @@
 import { z } from "zod";
 import { publicProcedure, router } from "@/lib/trpc/server";
-import { StatutContrat } from "@/generated/prisma/client";
+import { StatutContrat, StatutPipeline, CanalFinancement } from "@/generated/prisma/client";
 
-// Mapping du CSV vers l'enum Prisma StatutContrat
+// ─── Parsing CSV ─────────────────────────────────────────────────────────────
+
 function parseStatutContrat(raw: string): StatutContrat {
-  const normalized = raw.trim();
-  if (normalized === "Sous contrat") return StatutContrat.SousContrat;
-  if (normalized === "Hors contrat") return StatutContrat.HorsContrat;
+  const v = raw.trim();
+  if (v === "Sous contrat") return StatutContrat.SousContrat;
+  if (v === "Hors contrat") return StatutContrat.HorsContrat;
   return StatutContrat.Inconnu;
 }
 
-// Dérive les canaux de financement et formations proposables selon le statut
-function derivePublics(statut: StatutContrat): {
-  publicFormiris: boolean;
-  publicOpco: boolean;
-  formationsProposables: string[];
-} {
+// Dérive Formiris/OPCO/formations selon le statut contractuel
+function derivePublics(statut: StatutContrat) {
+  const all = [
+    "ia-pratique-enseignante",
+    "genially-enseigner",
+    "ia-genially-sequence",
+    "ia-admin-direction",
+    "genially-communication",
+    "pack-productivite-ia",
+  ];
   if (statut === StatutContrat.SousContrat) {
-    return {
-      publicFormiris: true,
-      publicOpco: true,
-      formationsProposables: [
-        "ia-pratique-enseignante",
-        "genially-enseigner",
-        "ia-genially-sequence",
-        "ia-admin-direction",
-        "genially-communication",
-        "pack-productivite-ia",
-      ],
-    };
+    return { publicFormiris: true, publicOpco: true, formationsProposables: all };
   }
   if (statut === StatutContrat.HorsContrat) {
-    return {
-      publicFormiris: false,
-      publicOpco: true,
-      // Hors contrat : tout le personnel finançable OPCO — toutes les formations
-      formationsProposables: [
-        "ia-pratique-enseignante",
-        "genially-enseigner",
-        "ia-genially-sequence",
-        "ia-admin-direction",
-        "genially-communication",
-        "pack-productivite-ia",
-      ],
-    };
+    // Hors contrat : tout l'effectif finançable OPCO, pas de Formiris
+    return { publicFormiris: false, publicOpco: true, formationsProposables: all };
   }
   return { publicFormiris: false, publicOpco: false, formationsProposables: [] };
 }
 
-// Parse le CSV séparateur ";" encodage UTF-8 BOM
 function parseCsvLine(line: string): string[] {
   return line.split(";").map((v) => v.trim());
 }
 
+// ─── Schéma de filtres partagé ────────────────────────────────────────────────
+
+const FilterSchema = z.object({
+  search: z.string().optional(),
+  region: z.string().optional(),
+  departement: z.string().optional(),
+  statutContrat: z.enum(["SousContrat", "HorsContrat", "Inconnu"]).optional(),
+  type: z.string().optional(),
+  hasSiteWeb: z.boolean().optional(),
+  hasContact: z.boolean().optional(),
+  hasEmail: z.boolean().optional(),
+  statutPipeline: z.nativeEnum(StatutPipeline).optional(),
+  publicFormiris: z.boolean().optional(),
+  publicOpco: z.boolean().optional(),
+});
+
+type Filters = z.infer<typeof FilterSchema>;
+
+function buildWhere(filters: Filters) {
+  const where: Record<string, unknown> = {};
+  if (filters.search) {
+    where.OR = [
+      { nomEtablissement: { contains: filters.search, mode: "insensitive" } },
+      { ville: { contains: filters.search, mode: "insensitive" } },
+      { uai: { contains: filters.search, mode: "insensitive" } },
+      { siret: { contains: filters.search, mode: "insensitive" } },
+    ];
+  }
+  if (filters.region) where.region = filters.region;
+  if (filters.departement) where.departement = filters.departement;
+  if (filters.statutContrat)
+    where.statutContrat = filters.statutContrat as StatutContrat;
+  if (filters.type) where.type = filters.type;
+  if (filters.hasSiteWeb !== undefined)
+    where.siteWeb = filters.hasSiteWeb ? { not: null } : null;
+  if (filters.hasEmail !== undefined)
+    where.email = filters.hasEmail ? { not: null } : null;
+  if (filters.publicFormiris !== undefined)
+    where.publicFormiris = filters.publicFormiris;
+  if (filters.publicOpco !== undefined)
+    where.publicOpco = filters.publicOpco;
+  if (filters.hasContact) {
+    where.contacts = { some: {} };
+  }
+  if (filters.statutPipeline) {
+    where.pipelineEntries = {
+      some: { statut: filters.statutPipeline },
+    };
+  }
+  return where;
+}
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
 export const etablissementRouter = router({
+  // Import CSV complet
   importCsv: publicProcedure
     .input(z.object({ content: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      // Retire le BOM UTF-8 éventuel
       const raw = input.content.replace(/^﻿/, "");
       const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
-
-      if (lines.length < 2) {
-        throw new Error("CSV vide ou sans données");
-      }
+      if (lines.length < 2) throw new Error("CSV vide ou sans données");
 
       const header = parseCsvLine(lines[0]);
-      // Colonnes attendues
       const idx = {
         uai: header.indexOf("UAI"),
         nom: header.indexOf("nom_etablissement"),
@@ -85,12 +117,8 @@ export const etablissementRouter = router({
         siteWeb: header.indexOf("site_web"),
         siret: header.indexOf("siret"),
         opcoProb: header.indexOf("OPCO_probable"),
-        contactDecisionnaire: header.indexOf("contact_decisionnaire"),
-        fonctionContact: header.indexOf("fonction_contact"),
-        profil: header.indexOf("profil_pedagogique_notes"),
         etat: header.indexOf("etat"),
       };
-
       if (idx.uai === -1) throw new Error("Colonne UAI introuvable");
 
       const dataLines = lines.slice(1);
@@ -98,7 +126,6 @@ export const etablissementRouter = router({
       let updated = 0;
       const errors: string[] = [];
 
-      // Upsert par batch de 100 pour les performances
       const BATCH = 100;
       for (let i = 0; i < dataLines.length; i += BATCH) {
         const batch = dataLines.slice(i, i + BATCH);
@@ -110,12 +137,9 @@ export const etablissementRouter = router({
               errors.push(`Ligne ${i + batchIdx + 2} : UAI manquant`);
               return;
             }
-
-            const statutRaw = idx.statutContrat !== -1 ? cols[idx.statutContrat] : "";
-            const statut = parseStatutContrat(statutRaw);
+            const statut = parseStatutContrat(cols[idx.statutContrat] ?? "");
             const { publicFormiris, publicOpco, formationsProposables } =
               derivePublics(statut);
-
             const data = {
               nomEtablissement: cols[idx.nom] ?? "",
               type: cols[idx.type] ?? "",
@@ -138,56 +162,174 @@ export const etablissementRouter = router({
               formationsProposables,
               etat: cols[idx.etat] || "Ouvert",
             };
-
-            const existing = await ctx.prisma.etablissement.findUnique({
+            const result = await ctx.prisma.etablissement.upsert({
               where: { uai },
-              select: { uai: true },
+              create: { uai, ...data },
+              update: data,
+              select: { uai: true, updatedAt: true, createdAt: true },
             });
-
-            if (existing) {
-              // Upsert sans écraser les enrichissements manuels
-              await ctx.prisma.etablissement.update({
-                where: { uai },
-                data: {
-                  ...data,
-                  // Ne pas écraser si déjà renseigné manuellement
-                  contactDecisionnaire: undefined,
-                  fonctionContact: undefined,
-                  profilPedagogiqueNotes: undefined,
-                },
-              });
-              updated++;
-            } else {
-              await ctx.prisma.etablissement.create({ data: { uai, ...data } });
+            if (result.createdAt.getTime() === result.updatedAt.getTime()) {
               added++;
+            } else {
+              updated++;
             }
           })
         );
       }
-
-      return {
-        total: dataLines.length,
-        added,
-        updated,
-        errors: errors.slice(0, 20),
-      };
+      return { total: dataLines.length, added, updated, errors: errors.slice(0, 20) };
     }),
 
-  count: publicProcedure.query(async ({ ctx }) => {
-    return ctx.prisma.etablissement.count();
+  // Liste filtrée et paginée
+  list: publicProcedure
+    .input(
+      z.object({
+        filters: FilterSchema.optional(),
+        page: z.number().int().min(1).default(1),
+        pageSize: z.number().int().min(1).max(500).default(100),
+        sortBy: z.string().optional(),
+        sortDir: z.enum(["asc", "desc"]).optional(),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      const { filters = {}, page, pageSize, sortBy = "nomEtablissement", sortDir = "asc" } = input;
+      const where = buildWhere(filters);
+
+      const [total, items] = await Promise.all([
+        ctx.prisma.etablissement.count({ where }),
+        ctx.prisma.etablissement.findMany({
+          where,
+          orderBy: { [sortBy]: sortDir },
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+          include: {
+            _count: { select: { contacts: true, activites: true } },
+            pipelineEntries: { select: { statut: true, canalFinancement: true } },
+          },
+        }),
+      ]);
+
+      return { items, total, page, pageSize, totalPages: Math.ceil(total / pageSize) };
+    }),
+
+  // Toutes les valeurs distinctes pour les dropdowns de filtre
+  filterOptions: publicProcedure.query(async ({ ctx }) => {
+    const [regions, departements, types] = await Promise.all([
+      ctx.prisma.etablissement.findMany({
+        where: { region: { not: null } },
+        select: { region: true },
+        distinct: ["region"],
+        orderBy: { region: "asc" },
+      }),
+      ctx.prisma.etablissement.findMany({
+        where: { departement: { not: null } },
+        select: { departement: true, codeDept: true },
+        distinct: ["departement"],
+        orderBy: { departement: "asc" },
+      }),
+      ctx.prisma.etablissement.findMany({
+        where: { type: { not: "" } },
+        select: { type: true },
+        distinct: ["type"],
+        orderBy: { type: "asc" },
+      }),
+    ]);
+    return {
+      regions: regions.map((r) => r.region!),
+      departements: departements.map((d) => ({ label: d.departement!, code: d.codeDept ?? "" })),
+      types: types.map((t) => t.type),
+    };
   }),
+
+  // Points géo pour la carte (uniquement les établissements géocodés)
+  mapPoints: publicProcedure
+    .input(FilterSchema.optional())
+    .query(async ({ ctx, input }) => {
+      const where = { ...buildWhere(input ?? {}), latitude: { not: null } };
+      return ctx.prisma.etablissement.findMany({
+        where,
+        select: {
+          uai: true,
+          nomEtablissement: true,
+          ville: true,
+          latitude: true,
+          longitude: true,
+          statutContrat: true,
+          type: true,
+          publicFormiris: true,
+          publicOpco: true,
+        },
+      });
+    }),
+
+  // Détail d'un établissement
+  get: publicProcedure
+    .input(z.object({ uai: z.string() }))
+    .query(async ({ ctx, input }) => {
+      return ctx.prisma.etablissement.findUnique({
+        where: { uai: input.uai },
+        include: {
+          contacts: { orderBy: { createdAt: "desc" } },
+          activites: {
+            orderBy: { createdAt: "desc" },
+            take: 20,
+            include: { contact: { select: { prenom: true, nom: true } } },
+          },
+          pipelineEntries: true,
+        },
+      });
+    }),
+
+  // Mise à jour partielle (enrichissement manuel)
+  update: publicProcedure
+    .input(
+      z.object({
+        uai: z.string(),
+        data: z.object({
+          contactDecisionnaire: z.string().optional(),
+          fonctionContact: z.string().optional(),
+          profilPedagogiqueNotes: z.string().optional(),
+          telephone: z.string().optional(),
+          email: z.string().optional(),
+          siteWeb: z.string().optional(),
+        }),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      return ctx.prisma.etablissement.update({
+        where: { uai: input.uai },
+        data: input.data,
+      });
+    }),
+
+  // Mise à jour statut pipeline
+  updatePipeline: publicProcedure
+    .input(
+      z.object({
+        uai: z.string(),
+        statut: z.nativeEnum(StatutPipeline),
+        canalFinancement: z.nativeEnum(CanalFinancement).optional(),
+        valeurEstimee: z.number().optional(),
+        probabilite: z.number().min(0).max(1).optional(),
+        notes: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const { uai, ...pipelineData } = input;
+      return ctx.prisma.pipelineEntry.upsert({
+        where: { etablissementId: uai },
+        create: { etablissementId: uai, ...pipelineData },
+        update: { ...pipelineData, movedAt: new Date() },
+      });
+    }),
+
+  // Counts pour le dashboard rapide
+  count: publicProcedure.query(({ ctx }) => ctx.prisma.etablissement.count()),
 
   countByStatut: publicProcedure.query(async ({ ctx }) => {
     const [sousContrat, horsContrat, inconnu] = await Promise.all([
-      ctx.prisma.etablissement.count({
-        where: { statutContrat: StatutContrat.SousContrat },
-      }),
-      ctx.prisma.etablissement.count({
-        where: { statutContrat: StatutContrat.HorsContrat },
-      }),
-      ctx.prisma.etablissement.count({
-        where: { statutContrat: StatutContrat.Inconnu },
-      }),
+      ctx.prisma.etablissement.count({ where: { statutContrat: StatutContrat.SousContrat } }),
+      ctx.prisma.etablissement.count({ where: { statutContrat: StatutContrat.HorsContrat } }),
+      ctx.prisma.etablissement.count({ where: { statutContrat: StatutContrat.Inconnu } }),
     ]);
     return { sousContrat, horsContrat, inconnu };
   }),
